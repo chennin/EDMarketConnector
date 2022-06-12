@@ -1,10 +1,33 @@
 """Inara Sync."""
 
+# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $#
+# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $#
+#
+# This is an EDMC 'core' plugin.
+#
+# All EDMC plugins are *dynamically* loaded at run-time.
+#
+# We build for Windows using `py2exe`.
+#
+# `py2exe` can't possibly know about anything in the dynamically loaded
+# core plugins.
+#
+# Thus you **MUST** check if any imports you add in this file are only
+# referenced in this file (or only in any other core plugin), and if so...
+#
+#     YOU MUST ENSURE THAT PERTINENT ADJUSTMENTS ARE MADE IN `setup.py`
+#     SO AS TO ENSURE THE FILES ARE ACTUALLY PRESENT IN AN END-USER
+#     INSTALLATION ON WINDOWS.
+#
+#
+# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $#
+# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $#
 import json
 import threading
 import time
 import tkinter as tk
 from collections import OrderedDict, defaultdict, deque
+from dataclasses import dataclass
 from operator import itemgetter
 from threading import Lock, Thread
 from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Mapping, NamedTuple, Optional
@@ -32,7 +55,10 @@ if TYPE_CHECKING:
 
 _TIMEOUT = 20
 FAKE = ('CQC', 'Training', 'Destination')  # Fake systems that shouldn't be sent to Inara
-CREDIT_RATIO = 1.05		# Update credits if they change by 5% over the course of a session
+# We only update Credits to Inara if the delta from the last sent value is
+# greater than certain thresholds
+CREDITS_DELTA_MIN_FRACTION = 0.05  # Fractional difference threshold
+CREDITS_DELTA_MIN_ABSOLUTE = 10_000_000  # Absolute difference threshold
 
 
 # These need to be defined above This
@@ -47,7 +73,8 @@ class Credentials(NamedTuple):
 EVENT_DATA = Union[Mapping[str, Any], Sequence[Mapping[str, Any]]]
 
 
-class Event(NamedTuple):
+@dataclass
+class Event:
     """Event represents an event for the Inara API."""
 
     name: str
@@ -74,7 +101,7 @@ class This:
         self.suppress_docked = False  # Skip initial Docked event if started docked
         self.cargo: Optional[List[OrderedDictT[str, Any]]] = None
         self.materials: Optional[List[OrderedDictT[str, Any]]] = None
-        self.lastcredits: int = 0  # Send credit update soon after Startup / new game
+        self.last_credits: int = 0  # Send credit update soon after Startup / new game
         self.storedmodules: Optional[List[OrderedDictT[str, Any]]] = None
         self.loadout: Optional[OrderedDictT[str, Any]] = None
         self.fleet: Optional[List[OrderedDictT[str, Any]]] = None
@@ -334,16 +361,21 @@ def journal_entry(  # noqa: C901, CCR001
 
     :return: str - empty if no error, else error string.
     """
-    if (ks := killswitch.get_disabled('plugins.inara.journal')).disabled:
-        logger.warning(f'Inara support has been disabled via killswitch: {ks.reason}')
+    should_return, new_entry = killswitch.check_killswitch('plugins.inara.journal', entry, logger)
+    if should_return:
         plug.show_error(_('Inara disabled. See Log.'))  # LANG: INARA support disabled via killswitch
+        logger.trace('returning due to killswitch match')
         return ''
 
-    elif (ks := killswitch.get_disabled(f'plugins.inara.journal.event.{entry["event"]}')).disabled:
-        logger.warning(f'event {entry["event"]} processing has been disabled via killswitch: {ks.reason}')
+    should_return, new_entry = killswitch.check_killswitch(
+        f'plugins.inara.journal.event.{entry["event"]}', new_entry, logger
+    )
+    if should_return:
+        logger.trace('returning due to killswitch match')
         # this can and WILL break state, but if we're concerned about it sending bad data, we'd disable globally anyway
         return ''
 
+    entry = new_entry
     this.on_foot = state['OnFoot']
     event_name: str = entry['event']
     this.cmdr = cmdr
@@ -365,7 +397,7 @@ def journal_entry(  # noqa: C901, CCR001
         this.suppress_docked = False
         this.cargo = None
         this.materials = None
-        this.lastcredits = 0
+        this.last_credits = 0
         this.storedmodules = None
         this.loadout = None
         this.fleet = None
@@ -376,8 +408,8 @@ def journal_entry(  # noqa: C901, CCR001
         this.station_marketid = None
 
     elif event_name in ('Resurrect', 'ShipyardBuy', 'ShipyardSell', 'SellShipOnRebuy'):
-        # Events that mean a significant change in credits so we should send credits after next "Update"
-        this.lastcredits = 0
+        # Events that mean a significant change in credits, so we should send credits after next "Update"
+        this.last_credits = 0
 
     elif event_name in ('ShipyardNew', 'ShipyardSwap') or (event_name == 'Location' and entry['Docked']):
         this.suppress_docked = True
@@ -412,22 +444,12 @@ def journal_entry(  # noqa: C901, CCR001
         this.station_marketid = None
 
     if config.get_int('inara_out') and not is_beta and not this.multicrew and credentials(cmdr):
-        current_creds = Credentials(this.cmdr, this.FID, str(credentials(this.cmdr)))
+        current_credentials = Credentials(this.cmdr, this.FID, str(credentials(this.cmdr)))
         try:
             # Dump starting state to Inara
             if (this.newuser or event_name == 'StartUp' or (this.newsession and event_name == 'Cargo')):
                 this.newuser = False
                 this.newsession = False
-
-                # Send rank info to Inara on startup
-                new_add_event(
-                    'setCommanderRankPilot',
-                    entry['timestamp'],
-                    [
-                        {'rankName': k.lower(), 'rankValue': v[0], 'rankProgress': v[1] / 100.0}
-                        for k, v in state['Rank'].items() if v is not None
-                    ]
-                )
 
                 # Don't send the API call with no values.
                 if state['Reputation']:
@@ -495,6 +517,19 @@ def journal_entry(  # noqa: C901, CCR001
 
                     this.loadout = make_loadout(state)
                     new_add_event('setCommanderShipLoadout', entry['timestamp'], this.loadout)
+
+            # Trigger off the "only observed as being after Ranks" event so that
+            # we have both current Ranks *and* current Progress within them.
+            elif event_name == 'Progress':
+                # Send rank info to Inara on startup
+                new_add_event(
+                    'setCommanderRankPilot',
+                    entry['timestamp'],
+                    [
+                        {'rankName': k.lower(), 'rankValue': v[0], 'rankProgress': v[1] / 100.0}
+                        for k, v in state['Rank'].items() if v is not None
+                    ]
+                )
 
             # Promotions
             elif event_name == 'Promotion':
@@ -730,17 +765,24 @@ def journal_entry(  # noqa: C901, CCR001
             logger.debug('Adding events', exc_info=e)
             return str(e)
 
-        # Send credits and stats to Inara on startup only - otherwise may be out of date
+        # We want to utilise some Statistics data, so don't setCommanderCredits here
         if event_name == 'LoadGame':
+            this.last_credits = state['Credits']
+
+        elif event_name == 'Statistics':
+            inara_data = {
+                'commanderCredits': state['Credits'],
+                'commanderLoan':    state['Loan'],
+            }
+            if entry.get('Bank_Account') is not None:
+                if entry['Bank_Account'].get('Current_Wealth') is not None:
+                    inara_data['commanderAssets'] = entry['Bank_Account']['Current_Wealth']
+
             new_add_event(
                 'setCommanderCredits',
                 entry['timestamp'],
-                {'commanderCredits': state['Credits'], 'commanderLoan': state['Loan']}
+                inara_data
             )
-
-            this.lastcredits = state['Credits']
-
-        elif event_name == 'Statistics':
             new_add_event('setCommanderGameStatistics', entry['timestamp'], state['Statistics'])  # may be out of date
 
         # Selling / swapping ships
@@ -830,7 +872,7 @@ def journal_entry(  # noqa: C901, CCR001
 
             if this.fleet != fleet:
                 this.fleet = fleet
-                this.filter_events(current_creds, lambda e: e.name != 'setCommanderShip')
+                this.filter_events(current_credentials, lambda e: e.name != 'setCommanderShip')
 
                 # this.events = [x for x in this.events if x['eventName'] != 'setCommanderShip']  # Remove any unsent
                 for ship in this.fleet:
@@ -843,7 +885,7 @@ def journal_entry(  # noqa: C901, CCR001
                 this.loadout = loadout
 
                 this.filter_events(
-                    current_creds,
+                    current_credentials,
                     lambda e: (
                         e.name != 'setCommanderShipLoadout'
                         or cast(dict, e.data)['shipGameID'] != cast(dict, this.loadout)['shipGameID'])
@@ -884,7 +926,7 @@ def journal_entry(  # noqa: C901, CCR001
                 # Only send on change
                 this.storedmodules = modules
                 # Remove any unsent
-                this.filter_events(current_creds, lambda e: e.name != 'setCommanderStorageModules')
+                this.filter_events(current_credentials, lambda e: e.name != 'setCommanderStorageModules')
 
                 # this.events = list(filter(lambda e: e['eventName'] != 'setCommanderStorageModules', this.events))
                 new_add_event('setCommanderStorageModules', entry['timestamp'], this.storedmodules)
@@ -1213,7 +1255,7 @@ def journal_entry(  # noqa: C901, CCR001
         if event_name == 'CommunityGoal':
             # Remove any unsent
             this.filter_events(
-                current_creds, lambda e: e.name not in ('setCommunityGoal', 'setCommanderCommunityGoalProgress')
+                current_credentials, lambda e: e.name not in ('setCommunityGoal', 'setCommanderCommunityGoalProgress')
             )
 
             # this.events = list(filter(
@@ -1342,23 +1384,8 @@ def cmdr_data(data: CAPIData, is_beta):  # noqa: CCR001
         this.station_link.update_idletasks()
 
     if config.get_int('inara_out') and not is_beta and not this.multicrew and credentials(this.cmdr):
-        if not (CREDIT_RATIO > this.lastcredits / data['commander']['credits'] > 1/CREDIT_RATIO):
-            this.filter_events(
-                Credentials(this.cmdr, this.FID, str(credentials(this.cmdr))),
-                lambda e: e.name != 'setCommanderCredits'
-            )
-
-            # this.events = [x for x in this.events if x['eventName'] != 'setCommanderCredits']  # Remove any unsent
-            new_add_event(
-                'setCommanderCredits',
-                data['timestamp'],
-                {
-                    'commanderCredits': data['commander']['credits'],
-                    'commanderLoan': data['commander'].get('debt', 0),
-                }
-            )
-
-            this.lastcredits = int(data['commander']['credits'])
+        # Only here to ensure the conditional is correct for future additions
+        pass
 
 
 def make_loadout(state: Dict[str, Any]) -> OrderedDictT[str, Any]:  # noqa: CCR001
@@ -1461,6 +1488,21 @@ def new_add_event(
         this.events[key].append(Event(name, timestamp, data))
 
 
+def clean_event_list(event_list: List[Event]) -> List[Event]:
+    """Check for killswitched events and remove or modify them as requested."""
+    out = []
+
+    for e in event_list:
+        bad, new_event = killswitch.check_killswitch(f'plugins.inara.worker.{e.name}', e.data, logger)
+        if bad:
+            continue
+
+        e.data = new_event
+        out.append(e)
+
+    return out
+
+
 def new_worker():
     """
     Handle sending events to the Inara API.
@@ -1475,6 +1517,7 @@ def new_worker():
             continue
 
         for creds, event_list in events.items():
+            event_list = clean_event_list(event_list)
             if not event_list:
                 continue
 
@@ -1490,8 +1533,10 @@ def new_worker():
                     {'eventName': e.name, 'eventTimestamp': e.timestamp, 'eventData': e.data} for e in event_list
                 ]
             }
+
             logger.info(f'sending {len(data["events"])} events for {creds.cmdr}')
-            logger.trace(f'Events:\n{json.dumps(data)}\n')
+            logger.trace_if('plugin.inara.events', f'Events:\n{json.dumps(data)}\n')
+
             try_send_data(TARGET_URL, data)
 
         time.sleep(WORKER_WAIT_TIME)
@@ -1542,6 +1587,7 @@ def send_data(url: str, data: Mapping[str, Any]) -> bool:  # noqa: CCR001
     :param data: the data to POST
     :return: success state
     """
+    # NB: As of 2022-01-25 Artie has stated the Inara API does *not* support compression
     r = this.session.post(url, data=json.dumps(data, separators=(',', ':')), timeout=_TIMEOUT)
     r.raise_for_status()
     reply = r.json()

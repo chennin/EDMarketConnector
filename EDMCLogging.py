@@ -42,12 +42,15 @@ import os
 import pathlib
 import tempfile
 from contextlib import suppress
+from fnmatch import fnmatch
 # So that any warning about accessing a protected member is only in one place.
 from sys import _getframe as getframe
 from threading import get_native_id as thread_native_id
+from time import gmtime
 from traceback import print_exc
 from typing import TYPE_CHECKING, Tuple, cast
 
+import config as config_mod
 from config import appcmdname, appname, config
 
 # TODO: Tests:
@@ -77,14 +80,37 @@ _default_loglevel = logging.DEBUG
 
 # Define a TRACE level
 LEVEL_TRACE = 5
+LEVEL_TRACE_ALL = 3
 logging.addLevelName(LEVEL_TRACE, "TRACE")
+logging.addLevelName(LEVEL_TRACE_ALL, "TRACE_ALL")
 logging.TRACE = LEVEL_TRACE  # type: ignore
+logging.TRACE_ALL = LEVEL_TRACE_ALL  # type: ignore
 logging.Logger.trace = lambda self, message, *args, **kwargs: self._log(  # type: ignore
     logging.TRACE,  # type: ignore
     message,
     args,
     **kwargs
 )
+
+# MAGIC n/a | 2022-01-20: We want logging timestamps to be in UTC, not least because the game journals log in UTC.
+# MAGIC-CONT: Note that the game client uses the ED server's idea of UTC, which can easily be different from machine
+# MAGIC-CONT: local idea of it.  So don't expect our log timestamps to perfectly match Journal ones.
+# MAGIC-CONT: See MAGIC tagged comment in Logger.__init__()
+logging.Formatter.converter = gmtime
+
+
+def _trace_if(self: logging.Logger, condition: str, message: str, *args, **kwargs) -> None:
+    if any(fnmatch(condition, p) for p in config_mod.trace_on):
+        self._log(logging.TRACE, message, args, **kwargs)  # type: ignore # we added it
+        return
+
+    self._log(logging.TRACE_ALL, message, args, **kwargs)  # type: ignore # we added it
+
+
+logging.Logger.trace_if = _trace_if  # type: ignore
+
+# we cant hide this from `from xxx` imports and I'd really rather no-one other than `logging` had access to it
+del _trace_if
 
 if TYPE_CHECKING:
     from types import FrameType
@@ -95,8 +121,16 @@ if TYPE_CHECKING:
         """LoggerMixin is a fake class that tells type checkers that trace exists on a given type."""
 
         def trace(self, message, *args, **kwargs) -> None:
-            """Fake trace method."""
-            return self._log(LEVEL_TRACE, message, args, **kwargs)
+            """See implementation above."""
+            ...
+
+        def trace_if(self, condition: str, message, *args, **kwargs) -> None:
+            """
+            Fake trace if method, traces only if condition exists in trace_on.
+
+            See implementation above.
+            """
+            ...
 
 
 class Logger:
@@ -135,7 +169,11 @@ class Logger:
 
         self.logger_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(process)d:%(thread)d:%(osthreadid)d %(module)s.%(qualname)s:%(lineno)d: %(message)s')  # noqa: E501
         self.logger_formatter.default_time_format = '%Y-%m-%d %H:%M:%S'
-        self.logger_formatter.default_msec_format = '%s.%03d'
+        # MAGIC n/a | 2022-01-20: As of Python 3.10.2 you can *not* use either `%s.%03.d` in default_time_format
+        # MAGIC-CONT: (throws exceptions), *or* use `%Z` in default_time_msec (more exceptions).
+        # MAGIC-CONT: ' UTC' is hard-coded here - we know we're using the local machine's idea of UTC/GMT because we
+        # MAGIC-CONT: cause logging.Formatter() to use `gmtime()` - see MAGIC comment in this file's top-level code.
+        self.logger_formatter.default_msec_format = '%s.%03d UTC'
 
         self.logger_channel.setFormatter(self.logger_formatter)
         self.logger.addHandler(self.logger_channel)
@@ -492,7 +530,7 @@ class EDMCContextFilter(logging.Filter):
         return module_name
 
 
-def get_main_logger() -> 'LoggerMixin':
+def get_main_logger(sublogger_name: str = '') -> 'LoggerMixin':
     """Return the correct logger for how the program is being run."""
     if not os.getenv("EDMC_NO_UI"):
         # GUI app being run

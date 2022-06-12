@@ -23,6 +23,16 @@ consistent with our vision for EDMC. Fundamental changes in particular need to b
 
 ---
 
+## Text formatting
+
+The project contains an `.editorconfig` file at its root.  Please either ensure
+your editor is taking note of those settings, or cross-check its contents
+with the
+[editorconfig documentation](https://github.com/editorconfig/editorconfig/wiki/EditorConfig-Properties)
+, and ensure your editor/IDE's settings match.
+
+---
+
 ## General workflow
 
 1. You will need a GitHub account.
@@ -181,9 +191,10 @@ only the 'C' (Patch) component.
 Going forwards we will always use the full [Semantic Version](https://semver.org/#semantic-versioning-specification-semver)
 and 'folder style' tag names, e.g. `Release/Major.Minor.Patch`.
 
-Currently the only file that defines the version code-wise is `config.py`.
-`Changelog.md` and `edmarketconnector.xml` are another matter handled as part
-of [the release process](docs/Releasing.md#distribution).
+Currently, the only file that defines the version code-wise is
+`config/__init__.py`. `Changelog.md` and `edmarketconnector.xml` are another
+matter handled as part of
+[the release process](docs/Releasing.md#distribution).
 
 ---
 
@@ -206,12 +217,18 @@ re-introduce a bug down the line.
 We use the [`pytest`](https://docs.pytest.org/en/stable/) for unit testing.
 
 The files for a test should go in a sub-directory of `tests/` named after the
-(principal) file that contains the code they are testing.  e.g. for
-journal_lock.py the tests are in `tests/journal_lock.py/test_journal_lock.py`.
-The `test_` prefix on `test_journal_lock.py` is necessary in order for `pytest`
-to recognise the file as containing tests to be run.
+(principal) file or directory that contains the code they are testing.
+For example:
+
+- Tests for `journal_lock.py` are in
+   `tests/journal_lock.py/test_journal_lock.py`. The `test_` prefix on
+   `test_journal_lock.py` is necessary in order for `pytest` to recognise the
+   file as containing tests to be run.
+- Tests for `config/` code are located in `tests/config/test_config.py`, not
+   `tests/config.py/test_config.py`
+
 The sub-directory avoids having a mess of files in `tests`, particularly when
-there might be supporting files, e.g. `tests/config.py/_old_config.py` or files
+there might be supporting files, e.g. `tests/config/_old_config.py` or files
 containing test data.
 
 Invoking just a bare `pytest` command will run all tests.
@@ -228,6 +245,42 @@ handy if you want to step through the testing code to be sure of anything.
 Otherwise, see the [pytest documentation](https://docs.pytest.org/en/stable/contents.html). 
 
 ---
+
+## Imports used only in core plugins
+
+Because the 'core' plugins, as with any EDMarketConnector plugin, are only ever
+loaded dynamically, not through an explicit `import` statement, there is no
+way for `py2exe` to know about them when building the contents of the
+`dist.win32` directory.  See [docs/Releasing.md](docs/Releasing.md) for more
+information about this build process.
+
+Thus, you **MUST** check if any imports you add in `plugins/*.py` files are only
+referenced in that file (or also only in any other core plugin), and if so
+**YOU MUST ENSURE THAT PERTINENT ADJUSTMENTS ARE MADE IN `setup.py`
+IN ORDER TO ENSURE THE FILES ARE ACTUALLY PRESENT IN AN END-USER
+INSTALLATION ON WINDOWS.**
+
+An exmaple is that as of 2022-02-01 it was noticed that `plugins/eddn.py` now
+uses `util/text.py`, and is the only code to do so.  `py2exe` does not detect
+this and thus the resulting `dist.win32/library.zip` does not contain the
+`util/` directory, let alone the `util/text.py` file.  The fix was to update
+the appropriate `packages` definition to:
+
+```python
+            'packages': [
+                'sqlite3',  # Included for plugins
+                'util',  # 2022-02-01 only imported in plugins/eddn.py
+            ],
+```
+
+Note that in this case it's in `packages` because we want the whole directory
+adding.  For a single file an extra item in `includes` would suffice.
+
+Such additions to `setup.py` should not cause any issues if subsequent project
+changes cause `py2exe` to automatically pick up the same file(s).
+
+---
+
 ## Debugging network sends
 
 Rather than risk sending bad data to a remote service, even if only through
@@ -247,10 +300,10 @@ from edmc_data import DEBUG_WEBSERVER_HOST, DEBUG_WEBSERVER_PORT
 
 TARGET_URL = 'https://www.edsm.net/api-journal-v1'
 if 'edsm' in debug_senders:
-    TARGET_URL = f'http://{DEBUG_WEBSERVER_HOST}:{DEBUG_WEBSERVER_PORT}/edsm'
+  TARGET_URL = f'http://{DEBUG_WEBSERVER_HOST}:{DEBUG_WEBSERVER_PORT}/edsm'
 
 ...
-    r = this.session.post(TARGET_URL, data=data, timeout=_TIMEOUT)
+r = this.requests_session.post(TARGET_URL, data=data, timeout=_TIMEOUT)
 ```
 
    Be sure to set a URL path in the `TARGET_URL` that denotes where the data
@@ -408,21 +461,31 @@ In addition to that we utilise one of the user-defined levels as:
   command-line argument and `.bat` file for users to enable it.  It cannot be
   selected from Settings in the UI.
 
-  As well as just using bare `logger.trace(...)` you can also gate it to only
-  log if asked to at invocation time by utilising the `--trace-on ...` 
-  command-line argument.  e.g.
- `EDMarketConnector.py --trace --trace-on edsm-cmdr-events`.  Note how you
-  still need to include `--trace`. The code to check and log would be like:
+  **Do not use a bare `logger.trace(...)` call** unless you're 100% certain 
+  it's only temporary **and will be removed before any code merge**.  In 
+  that case you would utilise `EDMarketConnector.py --trace` to see the output.
+
+  Instead, you should gate any TRACE logging using the `trace_if()` helper 
+  method provided on `logger`:
 
     ```python
-    from config import trace_on
+      logger.trace_if('journal.event.scan', 'my-log-message')
+    ```
+
+  The string used to identify this tracing should be related to the 
+  **function of the code**, not the particular file, or class, that it is in.
+  This is so that the same string can be used to trace code that spans more 
+  than one file, class, or other scope.
   
-    if 'edsm-cmdr-events' in trace_on:
-        logger.trace(f'De-queued ({cmdr=}, {entry["event"]=})')
-  ```
+  This would then be triggered by running EDMarketConnector with the 
+  appropriate command-line arguments:
+
+      EDMarketConnector.py --trace-on journal.event.scan
   
-  This way you can set up TRACE logging that won't spam just because of 
-  `--trace` being used.
+  Note that you do **not** also need to specify `--trace`, that's implied.
+  
+  This way you can set up TRACE logging that won't spam just because `--trace`
+  is used.
 
 ---
 
@@ -473,6 +536,20 @@ The description should cover exactly why the hack is needed, what it does, what 
 Please be verbose here, more info about weird choices is always prefered over magic that we struggle to understand in six months.
 
 Additionally, if your hack is over around 5 lines, please include a `# HACK END` or similar comment to indicate the end of the hack.
+
+# Use `sys.platform` for platform guards
+
+`mypy` (and `pylance`) understand platform guards and will show unreachable code / resolve imports correctly
+for platform specific things. However, this only works if you directly reference `sys.platform`, importantly 
+the following does not work:
+
+```py
+from sys import platform
+if platform == 'darwin':
+  ...
+```
+
+It **MUST** be `if sys.platform`.
 
 ---
 

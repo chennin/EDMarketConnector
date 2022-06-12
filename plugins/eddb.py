@@ -23,6 +23,28 @@
 #
 
 
+# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $#
+# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $#
+#
+# This is an EDMC 'core' plugin.
+#
+# All EDMC plugins are *dynamically* loaded at run-time.
+#
+# We build for Windows using `py2exe`.
+#
+# `py2exe` can't possibly know about anything in the dynamically loaded
+# core plugins.
+#
+# Thus you **MUST** check if any imports you add in this file are only
+# referenced in this file (or only in any other core plugin), and if so...
+#
+#     YOU MUST ENSURE THAT PERTINENT ADJUSTMENTS ARE MADE IN `setup.py`
+#     SO AS TO ENSURE THE FILES ARE ACTUALLY PRESENT IN AN END-USER
+#     INSTALLATION ON WINDOWS.
+#
+#
+# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $#
+# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $# ! $#
 import sys
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -94,14 +116,14 @@ def prefs_changed(cmdr, is_beta):
 
 
 def journal_entry(cmdr, is_beta, system, station, entry, state):
-    if (ks := killswitch.get_disabled('plugins.eddb.journal')).disabled:
-        logger.warning(f'Journal processing for EDDB has been disabled: {ks.reason}')
+    should_return, new_entry = killswitch.check_killswitch('plugins.eddb.journal', entry)
+    if should_return:
         # LANG: Journal Processing disabled due to an active killswitch
         plug.show_error(_('EDDB Journal processing disabled. See Log.'))
         return
 
-    elif (ks := killswitch.get_disabled(f'plugins.eddb.journal.event.{entry["event"]}')).disabled:
-        logger.warning(f'Processing of event {entry["event"]} has been disabled: {ks.reason}')
+    should_return, new_entry = killswitch.check_killswitch(f'plugins.eddb.journal.event.{entry["event"]}', new_entry)
+    if should_return:
         return
 
     this.on_foot = state['OnFoot']

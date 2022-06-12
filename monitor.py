@@ -1,16 +1,19 @@
 """Monitor for new Journal files and contents of latest."""
+#                                                                             v [sic]
+# spell-checker: words onfoot unforseen relog fsdjump suitloadoutid slotid suitid loadoutid fauto Intimidator
+# spell-checker: words joinacrew quitacrew sellshiponrebuy newbal navroute npccrewpaidwage sauto
 
 import json
 import pathlib
 import queue
 import re
+import sys
 import threading
 from calendar import timegm
 from collections import OrderedDict, defaultdict
 from os import SEEK_END, SEEK_SET, listdir
-from os.path import basename, expanduser, isdir, join
-from sys import platform
-from time import gmtime, localtime, sleep, strftime, strptime, time
+from os.path import basename, expanduser, getctime, isdir, join
+from time import gmtime, localtime, mktime, sleep, strftime, strptime, time
 from typing import TYPE_CHECKING, Any, BinaryIO, Dict, List, MutableMapping, Optional
 from typing import OrderedDict as OrderedDictT
 from typing import Tuple
@@ -19,17 +22,22 @@ if TYPE_CHECKING:
     import tkinter
 
 import util_ships
-from config import config, trace_on
+from config import config
 from edmc_data import edmc_suit_shortnames, edmc_suit_symbol_localised
 from EDMCLogging import get_main_logger
 
+# spell-checker: words navroute
+
 logger = get_main_logger()
+STARTUP = 'journal.startup'
+MAX_NAVROUTE_DISCREPANCY = 5  # Timestamp difference in seconds
+MAX_FCMATERIALS_DISCREPANCY = 5  # Timestamp difference in seconds
 
 if TYPE_CHECKING:
     def _(x: str) -> str:
         return x
 
-if platform == 'darwin':
+if sys.platform == 'darwin':
     from fcntl import fcntl
 
     from AppKit import NSWorkspace
@@ -37,7 +45,7 @@ if platform == 'darwin':
     from watchdog.observers import Observer
     F_GLOBAL_NOCACHE = 55
 
-elif platform == 'win32':
+elif sys.platform == 'win32':
     import ctypes
     from ctypes.wintypes import BOOL, HWND, LPARAM, LPWSTR
 
@@ -58,6 +66,10 @@ elif platform == 'win32':
 else:
     # Linux's inotify doesn't work over CIFS or NFS, so poll
     FileSystemEventHandler = object  # dummy
+    if TYPE_CHECKING:
+        # this isn't ever used, but this will make type checking happy
+        from watchdog.events import FileCreatedEvent
+        from watchdog.observers import Observer
 
 
 # Journal handler
@@ -69,7 +81,8 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
     _POLL = 1		# Polling is cheap, so do it often
     _RE_CANONICALISE = re.compile(r'\$(.+)_name;')
     _RE_CATEGORY = re.compile(r'\$MICRORESOURCE_CATEGORY_(.+);')
-    _RE_LOGFILE = re.compile(r'^Journal(Alpha|Beta)?\.[0-9]{12}\.[0-9]{2}\.log$')
+    _RE_LOGFILE = re.compile(r'^Journal(Alpha|Beta)?\.[0-9]{2,4}(-)?[0-9]{2}(-)?[0-9]{2}(T)?[0-9]{2}[0-9]{2}[0-9]{2}'
+                             r'\.[0-9]{2}\.log$')
     _RE_SHIP_ONFOOT = re.compile(r'^(FlightSuit|UtilitySuit_Class.|TacticalSuit_Class.|ExplorationSuit_Class.)$')
 
     def __init__(self) -> None:
@@ -91,6 +104,8 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
         # If 1 or 2 a LoadGame event will happen when the game goes live.
         # If 3 we need to inject a special 'StartUp' event since consumers won't see the LoadGame event.
         self.live = False
+        # And whilst we're parsing *only to catch up on state*, we might not want to fully process some things
+        self.catching_up = False
 
         self.game_was_running = False  # For generation of the "ShutDown" event
 
@@ -109,6 +124,12 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
         self.systemaddress: Optional[int] = None
         self.systempopulation: Optional[int] = None
         self.started: Optional[int] = None  # Timestamp of the LoadGame event
+
+        self._navroute_retries_remaining = 0
+        self._last_navroute_journal_timestamp: Optional[float] = None
+
+        self._fcmaterials_retries_remaining = 0
+        self._last_fcmaterials_journal_timestamp: Optional[float] = None
 
         self.__init_state()
 
@@ -164,8 +185,11 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
             'SuitLoadouts':       {},
             'Taxi':               None,  # True whenever we are _in_ a taxi. ie, this is reset on Disembark etc.
             'Dropship':           None,  # Best effort as to whether or not the above taxi is a dropship.
+            'StarPos':            None,  # Best effort current system's galaxy position.
             'Body':               None,
             'BodyType':           None,
+
+            'NavRoute':           None,
         }
 
     def start(self, root: 'tkinter.Tk') -> bool:  # noqa: CCR001
@@ -195,15 +219,10 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
 
         self.currentdir = logdir
 
-        # Latest pre-existing logfile - e.g. if E:D is already running. Assumes logs sort alphabetically.
+        # Latest pre-existing logfile - e.g. if E:D is already running.
         # Do this before setting up the observer in case the journal directory has gone away
         try:  # TODO: This should be replaced with something specific ONLY wrapping listdir
-            logfiles = sorted(
-                (x for x in listdir(self.currentdir) if self._RE_LOGFILE.search(x)),
-                key=lambda x: x.split('.')[1:]
-            )
-
-            self.logfile = join(self.currentdir, logfiles[-1]) if logfiles else None  # type: ignore
+            self.logfile = self.journal_newest_filename(self.currentdir)
 
         except Exception:
             logger.exception('Failed to find latest logfile')
@@ -214,7 +233,7 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
         # File system events are unreliable/non-existent over network drives on Linux.
         # We can't easily tell whether a path points to a network drive, so assume
         # any non-standard logdir might be on a network drive and poll instead.
-        polling = bool(config.get_str('journaldir')) and platform != 'win32'
+        polling = bool(config.get_str('journaldir')) and sys.platform != 'win32'
         if not polling and not self.observer:
             logger.debug('Not polling, no observer, starting an observer...')
             self.observer = Observer()
@@ -246,6 +265,28 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
         logger.debug('Done.')
         return True
 
+    def journal_newest_filename(self, journals_dir) -> Optional[str]:
+        """
+        Determine the newest Journal file name.
+
+        :param journals_dir: The directory to check
+        :return: The `str` form of the full path to the newest Journal file
+        """
+        # os.listdir(None) returns CWD's contents
+        if journals_dir is None:
+            return None
+
+        journal_files = (x for x in listdir(journals_dir) if self._RE_LOGFILE.search(x))
+        if journal_files:
+            # Odyssey Update 11 has, e.g.    Journal.2022-03-15T152503.01.log
+            # Horizons Update 11 equivalent: Journal.220315152335.01.log
+            # So we can no longer use a naive sort.
+            journals_dir_path = pathlib.Path(journals_dir)
+            journal_files = (journals_dir_path / pathlib.Path(x) for x in journal_files)
+            return str(max(journal_files, key=getctime))
+
+        return None
+
     def stop(self) -> None:
         """Stop journal monitoring."""
         logger.debug('Stopping monitoring Journal')
@@ -271,6 +312,7 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
         if self.observed:
             logger.debug('self.observed: Calling unschedule_all()')
             self.observed = None
+            assert self.observer is not None, 'Observer was none but it is in use?'
             self.observer.unschedule_all()
             logger.debug('Done')
 
@@ -330,19 +372,21 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
         logfile = self.logfile
         if logfile:
             loghandle: BinaryIO = open(logfile, 'rb', 0)  # unbuffered
-            if platform == 'darwin':
+            if sys.platform == 'darwin':
                 fcntl(loghandle, F_GLOBAL_NOCACHE, -1)  # required to avoid corruption on macOS over SMB
 
+            self.catching_up = True
             for line in loghandle:
                 try:
-                    # if b'"event":"Location"' in line:
-                    #     logger.trace('"Location" event in the past at startup')
+                    if b'"event":"Location"' in line:
+                        logger.trace_if('journal.locations', '"Location" event in the past at startup')
 
                     self.parse_entry(line)  # Some events are of interest even in the past
 
                 except Exception as ex:
                     logger.debug(f'Invalid journal entry:\n{line!r}\n', exc_info=ex)
 
+            self.catching_up = False
             log_pos = loghandle.tell()
 
         else:
@@ -381,29 +425,29 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
                 self.event_queue.put(None)
                 self.live = False
 
+        emitter = None
         # Watchdog thread -- there is a way to get this by using self.observer.emitters and checking for an attribute:
         # watch, but that may have unforseen differences in behaviour.
-        emitter = self.observed and self.observer._emitter_for_watch[self.observed]  # Note: Uses undocumented attribute
+        if self.observed:
+            assert self.observer is not None, 'self.observer is None but also in use?'
+            # Note: Uses undocumented attribute
+            emitter = self.observed and self.observer._emitter_for_watch[self.observed]
 
         logger.debug('Entering loop...')
         while True:
 
             # Check whether new log file started, e.g. client (re)started.
             if emitter and emitter.is_alive():
-                newlogfile = self.logfile  # updated by on_created watchdog callback
+                new_journal_file: Optional[str] = self.logfile  # updated by on_created watchdog callback
+
             else:
                 # Poll
                 try:
-                    logfiles = sorted(
-                        (x for x in listdir(self.currentdir) if self._RE_LOGFILE.search(x)),
-                        key=lambda x: x.split('.')[1:]
-                    )
-
-                    newlogfile = join(self.currentdir, logfiles[-1]) if logfiles else None  # type: ignore
+                    new_journal_file = self.journal_newest_filename(self.currentdir)
 
                 except Exception:
                     logger.exception('Failed to find latest logfile')
-                    newlogfile = None
+                    new_journal_file = None
 
             if logfile:
                 loghandle.seek(0, SEEK_END)		  # required to make macOS notice log change over SMB
@@ -416,30 +460,30 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
 
                     if b'"event":"Continue"' in line:
                         for _ in range(10):
-                            logger.trace("****")
-                        logger.trace('Found a Continue event, its being added to the list, we will finish this file up'
-                                     ' and then continue with the next')
+                            logger.trace_if('journal.continuation', "****")
+                        logger.trace_if('journal.continuation', 'Found a Continue event, its being added to the list, '
+                                        'we will finish this file up and then continue with the next')
 
                     self.event_queue.put(line)
 
                 if not self.event_queue.empty():
                     if not config.shutting_down:
-                        # logger.trace('Sending <<JournalEvent>>')
+                        logger.trace_if('journal.queue', 'Sending <<JournalEvent>>')
                         self.root.event_generate('<<JournalEvent>>', when="tail")
 
                 log_pos = loghandle.tell()
 
-            if logfile != newlogfile:
+            if logfile != new_journal_file:
                 for _ in range(10):
-                    logger.trace("****")
-                logger.info(f'New Journal File. Was "{logfile}", now "{newlogfile}"')
-                logfile = newlogfile
+                    logger.trace_if('journal.file', "****")
+                logger.info(f'New Journal File. Was "{logfile}", now "{new_journal_file}"')
+                logfile = new_journal_file
                 if loghandle:
                     loghandle.close()
 
                 if logfile:
                     loghandle = open(logfile, 'rb', 0)  # unbuffered
-                    if platform == 'darwin':
+                    if sys.platform == 'darwin':
                         fcntl(loghandle, F_GLOBAL_NOCACHE, -1)  # required to avoid corruption on macOS over SMB
 
                     log_pos = 0
@@ -463,7 +507,7 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
                     )
 
                     if not config.shutting_down:
-                        # logger.trace('Sending <<JournalEvent>>')
+                        logger.trace_if('journal.queue', 'Sending <<JournalEvent>>')
                         self.root.event_generate('<<JournalEvent>>', when="tail")
 
                     self.game_was_running = False
@@ -493,6 +537,8 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
             entry: MutableMapping[str, Any] = json.loads(line, object_pairs_hook=OrderedDict)
             entry['timestamp']  # we expect this to exist # TODO: replace with assert? or an if key in check
 
+            self.__navroute_retry()
+
             event_type = entry['event'].lower()
             if event_type == 'fileheader':
                 self.live = False
@@ -518,8 +564,7 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
                 self.live = True  # First event in 3.0
                 self.cmdr = entry['Name']
                 self.state['FID'] = entry['FID']
-                if 'startup' in trace_on:
-                    logger.trace(f'"Commander" event, {monitor.cmdr=}, {monitor.state["FID"]=}')
+                logger.trace_if(STARTUP, f'"Commander" event, {monitor.cmdr=}, {monitor.state["FID"]=}')
 
             elif event_type == 'loadgame':
                 # Odyssey Release Update 5 -- This contains data that doesn't match the format used in FileHeader above
@@ -529,7 +574,13 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
                 # Odyssey: bool
                 self.cmdr = entry['Commander']
                 # 'Open', 'Solo', 'Group', or None for CQC (and Training - but no LoadGame event)
-                self.mode = entry.get('GameMode')
+                if not entry.get('Ship') and not entry.get('GameMode') or entry.get('GameMode', '').lower() == 'cqc':
+                    logger.trace_if('journal.loadgame.cqc', f'loadgame to cqc: {entry}')
+                    self.mode = 'CQC'
+
+                else:
+                    self.mode = entry.get('GameMode')
+
                 self.group = entry.get('Group')
                 self.planet = None
                 self.system = None
@@ -548,10 +599,12 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
                     'Horizons':   entry['Horizons'],  # From 3.0
                     'Odyssey':    entry.get('Odyssey', False),  # From 4.0 Odyssey
                     'Loan':       entry['Loan'],
-                    'Engineers':  {},
-                    'Rank':       {},
-                    'Reputation': {},
-                    'Statistics': {},
+                    # For Odyssey, by 4.0.0.100, and at least from Horizons 3.8.0.201 the order of events changed
+                    # to LoadGame being after some 'status' events.
+                    # 'Engineers':  {},  # 'EngineerProgress' event now before 'LoadGame'
+                    # 'Rank':       {},  # 'Rank'/'Progress' events now before 'LoadGame'
+                    # 'Reputation': {},  # 'Reputation' event now before 'LoadGame'
+                    'Statistics': {},  # Still after 'LoadGame' in 4.0.0.903
                     'Role':       None,
                     'Taxi':       None,
                     'Dropship':   None,
@@ -561,8 +614,7 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
                 if entry.get('Ship') is not None and self._RE_SHIP_ONFOOT.search(entry['Ship']):
                     self.state['OnFoot'] = True
 
-                if 'startup' in trace_on:
-                    logger.trace(f'"LoadGame" event, {monitor.cmdr=}, {monitor.state["FID"]=}')
+                logger.trace_if(STARTUP, f'"LoadGame" event, {monitor.cmdr=}, {monitor.state["FID"]=}')
 
             elif event_type == 'newcommander':
                 self.cmdr = entry['Name']
@@ -678,7 +730,7 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
                 # This event is logged when a player (on foot) gets into a ship or SRV
                 # Parameters:
                 #     • SRV: true if getting into SRV, false if getting into a ship
-                #     • Taxi: true when boarding a taxi transposrt ship
+                #     • Taxi: true when boarding a taxi transport ship
                 #     • Multicrew: true when boarding another player’s vessel
                 #     • ID: player’s ship ID (if players own vessel)
                 #     • StarSystem
@@ -706,7 +758,7 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
                 #
                 # Parameters:
                 #     • SRV: true if getting out of SRV, false if getting out of a ship
-                #     • Taxi: true when getting out of a taxi transposrt ship
+                #     • Taxi: true when getting out of a taxi transport ship
                 #     • Multicrew: true when getting out of another player’s vessel
                 #     • ID: player’s ship ID (if players own vessel)
                 #     • StarSystem
@@ -759,8 +811,8 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
                     self.state['Body'] = entry.get('Body')
                     self.state['BodyType'] = entry.get('BodyType')
 
-                    # if event_type == 'location':
-                    #     logger.trace('"Location" event')
+                    if event_type == 'location':
+                        logger.trace_if('journal.locations', '"Location" event')
 
                 elif event_type == 'fsdjump':
                     self.planet = None
@@ -768,13 +820,18 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
                     self.state['BodyType'] = None
 
                 if 'StarPos' in entry:
-                    self.coordinates = tuple(entry['StarPos'])  # type: ignore
+                    # Plugins need this as well, so copy in state
+                    self.state['StarPos'] = self.coordinates = tuple(entry['StarPos'])  # type: ignore
 
                 self.systemaddress = entry.get('SystemAddress')
 
                 self.systempopulation = entry.get('Population')
 
-                self.system = 'CQC' if entry['StarSystem'] == 'ProvingGround' else entry['StarSystem']
+                if entry['StarSystem'] == 'ProvingGround':
+                    self.system = 'CQC'
+
+                else:
+                    self.system = entry['StarSystem']
 
                 self.station = entry.get('StationName')  # May be None
                 # If on foot in-station 'Docked' is false, but we have a
@@ -1205,6 +1262,7 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
                         }
 
                     except KeyError:
+                        # TODO: Log the exception details too, for some clue about *which* key
                         logger.error(f"LoadoutEquipModule: {entry}")
 
             elif event_type == 'loadoutremovemodule':
@@ -1296,17 +1354,25 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
                 self.state['Credits'] += entry.get('Refund', 0)
                 self.state['Taxi'] = False
 
-            elif event_type == 'navroute':
+            elif event_type == 'navroute' and not self.catching_up:
+                # assume we've failed out the gate, then pull it back if things are fine
+                self._last_navroute_journal_timestamp = mktime(strptime(entry['timestamp'], '%Y-%m-%dT%H:%M:%SZ'))
+                self._navroute_retries_remaining = 11
+
                 # Added in ED 3.7 - multi-hop route details in NavRoute.json
-                with open(join(self.currentdir, 'NavRoute.json'), 'rb') as rf:  # type: ignore
-                    try:
-                        entry = json.load(rf)
+                # rather than duplicating this, lets just call the function
+                if self.__navroute_retry():
+                    entry = self.state['NavRoute']
 
-                    except json.JSONDecodeError:
-                        logger.exception('Failed decoding NavRoute.json', exc_info=True)
+            elif event_type == 'fcmaterials' and not self.catching_up:
+                # assume we've failed out the gate, then pull it back if things are fine
+                self._last_fcmaterials_journal_timestamp = mktime(strptime(entry['timestamp'], '%Y-%m-%dT%H:%M:%SZ'))
+                self._fcmaterials_retries_remaining = 11
 
-                    else:
-                        self.state['NavRoute'] = entry
+                # Added in ED 4.0.0.1300 - Fleet Carrier Materials market in FCMaterials.json
+                # rather than duplicating this, lets just call the function
+                if fcmaterials := self.__fcmaterials_retry():
+                    entry = fcmaterials
 
             elif event_type == 'moduleinfo':
                 with open(join(self.currentdir, 'ModulesInfo.json'), 'rb') as mf:  # type: ignore
@@ -1390,7 +1456,7 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
                 category = self.category(received['Category'])
                 state_category[received['Material']] += received['Quantity']
 
-            elif event_type == 'EngineerCraft' or (
+            elif event_type == 'engineercraft' or (
                 event_type == 'engineerlegacyconvert' and not entry.get('IsPreview')
             ):
 
@@ -1864,16 +1930,16 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
             logger.debug('Called whilst self.thread is None, returning')
             return None
 
-        # logger.trace('Begin')
+        logger.trace_if('journal.queue', 'Begin')
         if self.event_queue.empty() and self.game_running():
             logger.error('event_queue is empty whilst game_running, this should not happen, returning')
             return None
 
-        # logger.trace('event_queue NOT empty')
+        logger.trace_if('journal.queue', 'event_queue NOT empty')
         entry = self.parse_entry(self.event_queue.get_nowait())
 
-        # if entry['event'] == 'Location':
-        #     logger.trace('"Location" event')
+        if entry['event'] == 'Location':
+            logger.trace_if('journal.locations', '"Location" event')
 
         if not self.live and entry['event'] not in (None, 'Fileheader'):
             # Game not running locally, but Journal has been updated
@@ -1901,8 +1967,8 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
                     ('SystemAddress', self.systemaddress),
                 ])
 
-            # if entry['event'] == 'Location':
-            #     logger.trace('Appending "Location" event to event_queue')
+            if entry['event'] == 'Location':
+                logger.trace_if('journal.locations', 'Appending "Location" event to event_queue')
 
             self.event_queue.put(json.dumps(entry, separators=(', ', ':')))
 
@@ -1922,12 +1988,12 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
 
         :return: bool - True if the game is running.
         """
-        if platform == 'darwin':
+        if sys.platform == 'darwin':
             for app in NSWorkspace.sharedWorkspace().runningApplications():
                 if app.bundleIdentifier() == 'uk.co.frontier.EliteDangerous':
                     return True
 
-        elif platform == 'win32':
+        elif sys.platform == 'win32':
             def WindowTitle(h):  # noqa: N802 # type: ignore
                 if h:
                     length = GetWindowTextLength(h) + 1
@@ -2148,6 +2214,133 @@ class EDLogs(FileSystemEventHandler):  # type: ignore # See below
             }
 
         return slots
+
+    def _parse_navroute_file(self) -> Optional[dict[str, Any]]:
+        """Read and parse NavRoute.json."""
+        if self.currentdir is None:
+            raise ValueError('currentdir unset')
+
+        try:
+
+            with open(join(self.currentdir, 'NavRoute.json'), 'r') as f:
+                raw = f.read()
+
+        except Exception as e:
+            logger.exception(f'Could not open navroute file. Bailing: {e}')
+            return None
+
+        try:
+            data = json.loads(raw)
+
+        except json.JSONDecodeError:
+            logger.exception('Failed to decode NavRoute.json', exc_info=True)
+            return None
+
+        if 'timestamp' not in data:  # quick sanity check
+            return None
+
+        return data
+
+    def _parse_fcmaterials_file(self) -> Optional[dict[str, Any]]:
+        """Read and parse FCMaterials.json."""
+        if self.currentdir is None:
+            raise ValueError('currentdir unset')
+
+        try:
+
+            with open(join(self.currentdir, 'FCMaterials.json'), 'r') as f:
+                raw = f.read()
+
+        except Exception as e:
+            logger.exception(f'Could not open FCMaterials file. Bailing: {e}')
+            return None
+
+        try:
+            data = json.loads(raw)
+
+        except json.JSONDecodeError:
+            logger.exception('Failed to decode FCMaterials.json', exc_info=True)
+            return None
+
+        if 'timestamp' not in data:  # quick sanity check
+            return None
+
+        return data
+
+    @staticmethod
+    def _parse_journal_timestamp(source: str) -> float:
+        return mktime(strptime(source, '%Y-%m-%dT%H:%M:%SZ'))
+
+    def __navroute_retry(self) -> bool:
+        """Retry reading navroute files."""
+        if self._navroute_retries_remaining == 0:
+            return False
+
+        logger.debug(f'Navroute read retry [{self._navroute_retries_remaining}]')
+        self._navroute_retries_remaining -= 1
+
+        if self._last_navroute_journal_timestamp is None:
+            logger.critical('Asked to retry for navroute but also no set time to compare? This is a bug.')
+            return False
+
+        if (file := self._parse_navroute_file()) is None:
+            logger.debug(
+                'Failed to parse NavRoute.json. '
+                + ('Trying again' if self._navroute_retries_remaining > 0 else 'Giving up')
+            )
+            return False
+
+        # _parse_navroute_file verifies that this exists for us
+        file_time = self._parse_journal_timestamp(file['timestamp'])
+        if abs(file_time - self._last_navroute_journal_timestamp) > MAX_NAVROUTE_DISCREPANCY:
+            logger.debug(
+                f'Time discrepancy of more than {MAX_NAVROUTE_DISCREPANCY}s --'
+                f' ({abs(file_time - self._last_navroute_journal_timestamp)}).'
+                f' {"Trying again" if self._navroute_retries_remaining > 0 else "Giving up"}.'
+            )
+            return False
+
+        # everything is good, lets set what we need to and make sure we dont try again
+        logger.info('Successfully read NavRoute file for last NavRoute event.')
+        self.state['NavRoute'] = file
+        self._navroute_retries_remaining = 0
+        self._last_navroute_journal_timestamp = None
+        return True
+
+    def __fcmaterials_retry(self) -> Optional[Dict[str, Any]]:
+        """Retry reading FCMaterials files."""
+        if self._fcmaterials_retries_remaining == 0:
+            return None
+
+        logger.debug(f'FCMaterials read retry [{self._fcmaterials_retries_remaining}]')
+        self._fcmaterials_retries_remaining -= 1
+
+        if self._last_fcmaterials_journal_timestamp is None:
+            logger.critical('Asked to retry for FCMaterials but also no set time to compare? This is a bug.')
+            return None
+
+        if (file := self._parse_fcmaterials_file()) is None:
+            logger.debug(
+                'Failed to parse FCMaterials.json. '
+                + ('Trying again' if self._fcmaterials_retries_remaining > 0 else 'Giving up')
+            )
+            return None
+
+        # _parse_fcmaterials_file verifies that this exists for us
+        file_time = self._parse_journal_timestamp(file['timestamp'])
+        if abs(file_time - self._last_fcmaterials_journal_timestamp) > MAX_FCMATERIALS_DISCREPANCY:
+            logger.debug(
+                f'Time discrepancy of more than {MAX_FCMATERIALS_DISCREPANCY}s --'
+                f' ({abs(file_time - self._last_fcmaterials_journal_timestamp)}).'
+                f' {"Trying again" if self._fcmaterials_retries_remaining > 0 else "Giving up"}.'
+            )
+            return None
+
+        # everything is good, lets set what we need to and make sure we dont try again
+        logger.info('Successfully read FCMaterials file for last FCMaterials event.')
+        self._fcmaterials_retries_remaining = 0
+        self._last_fcmaterials_journal_timestamp = None
+        return file
 
 
 # singleton
